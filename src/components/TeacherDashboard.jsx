@@ -373,11 +373,13 @@ const TeacherDashboard = ({ gameState, sendMessage, messages, connected }) => {
                           fontWeight: '500',
                           background: client.currentMode === 'asker' ? '#0071e3' : 
                                      client.currentMode === 'answerer' ? '#34c759' : 
+                                     client.currentMode === 'challenging' ? '#FF9500' :
                                      '#8e8e93',
                           color: '#1d1d1f'
                         }}>
                           {client.currentMode === 'asker' ? 'Q' : 
-                           client.currentMode === 'answerer' ? 'A' : '•'}
+                           client.currentMode === 'answerer' ? 'A' : 
+                           client.currentMode === 'challenging' ? 'C' : '•'}
                         </span>
                       </div>
                     </div>
@@ -448,11 +450,13 @@ const TeacherDashboard = ({ gameState, sendMessage, messages, connected }) => {
                           fontWeight: '500',
                           background: client.currentMode === 'asker' ? '#0071e3' : 
                                      client.currentMode === 'answerer' ? '#34c759' : 
+                                     client.currentMode === 'challenging' ? '#FF9500' :
                                      '#8e8e93',
                           color: '#1d1d1f'
                         }}>
                           {client.currentMode === 'asker' ? 'Q' : 
-                           client.currentMode === 'answerer' ? 'A' : '•'}
+                           client.currentMode === 'answerer' ? 'A' : 
+                           client.currentMode === 'challenging' ? 'C' : '•'}
                         </span>
                       </div>
                     </div>

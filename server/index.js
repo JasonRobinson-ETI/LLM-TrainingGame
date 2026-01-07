@@ -309,6 +309,24 @@ function endGame() {
 }
 
 function resetKnowledge() {
+  // ensure the game stops
+  console.log('[SERVER] Ending game loop for reset...');
+  gameState.isActive = false;
+  
+  // Clear all intervals
+  if (evolutionInterval) {
+    clearInterval(evolutionInterval);
+    evolutionInterval = null;
+  }
+  if (challengeInterval) {
+    clearInterval(challengeInterval);
+    challengeInterval = null;
+  }
+  if (llmPrimingInterval) {
+    clearInterval(llmPrimingInterval);
+    llmPrimingInterval = null;
+  }
+
   // Create NEW empty arrays with fresh references to force React updates
   gameState.trainingData = [];
   gameState.llmKnowledge = [];

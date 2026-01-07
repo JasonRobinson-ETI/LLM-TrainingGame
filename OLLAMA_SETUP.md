@@ -37,7 +37,7 @@ ollama pull gemma:2b
 Edit `server/llmService.js` and change the model name if desired:
 
 ```javascript
-this.modelName = 'gemma:2b'; // or 'tinyllama', 'phi', etc.
+this.modelName = 'gemma:2b';
 ```
 
 ### 5. Start Your Server
