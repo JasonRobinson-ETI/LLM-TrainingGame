@@ -1,5 +1,4 @@
 import si from 'systeminformation';
-import { networkInterfaces } from 'os';
 
 class LLMService {
   constructor() {
@@ -8,31 +7,9 @@ class LLMService {
     const requiredEnv = (process.env.OLLAMA_REQUIRED || 'true').toLowerCase();
     this.requireOllama = requiredEnv === '1' || requiredEnv === 'true' || requiredEnv === 'yes';
 
-    // Identify local IPs to prevent duplicates
-    const localIPs = new Set(['localhost', '127.0.0.1']);
-    const nets = networkInterfaces();
-    for (const name of Object.keys(nets)) {
-      for (const net of nets[name]) {
-        if (net.family === 'IPv4' && !net.internal) {
-          localIPs.add(net.address);
-        }
-      }
-    }
-
     const normalizeBase = (s) => {
       if (!s) return null;
       let base = s.trim();
-      
-      // Check if hostname is a local IP and normalize to 127.0.0.1
-      for (const ip of localIPs) {
-        if (base.includes(ip)) {
-          base = base.replace(ip, '127.0.0.1');
-          break; 
-        }
-      }
-
-      // Normalize localhost to 127.0.0.1 to prevent duplicates
-      base = base.replace('localhost', '127.0.0.1');
       if (!/^https?:\/\//.test(base)) base = `http://${base}`;
       if (!/:\d+$/.test(base)) base = `${base}:11434`;
       return base.replace(/\/$/, '');
@@ -54,8 +31,7 @@ class LLMService {
     }
 
     // 3. Always ensure localhost is included for benchmarking
-    bases.add(normalizeBase('127.0.0.1'));
-    //bases.add(normalizeBase('localhost')); // Already caught by 127.0.0.1 normalization
+    bases.add(normalizeBase('localhost'));
 
     this.ollamaBases = Array.from(bases).filter(Boolean);
     console.log('[LLM] Ollama bases:', this.ollamaBases.join(', '));
