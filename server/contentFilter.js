@@ -49,10 +49,11 @@ function censorText(input, options = {}) {
   const banned = (options.bannedWords || [
     // General profanity
     'ass', 'shit', 'fuck', 'bitch', 'dick', 'bastard', 'crap', 'hell', 'damn', 'prick', 'slut', 
-    'cunt', 'whore', 'cock', 'pussy', 'hoe', 'titty', 'boob',
+    'cunt', 'whore', 'cock', 'pussy', 'hoe', 'titty', 'boob', 'asshole', 'asswipe', 'bullshit',
+    'nutjob', 'suck my',
     // Racial slurs - African/Black
     'nigger', 'nigga', 'niger', 'coon', 'jigaboo', 'pickaninny', 'sambo', 'spook', 'uncle tom',
-    'cotton picker', 'porch monkey', 'tar baby',
+    'cotton picker', 'porch monkey', 'tar baby', 'higer', 'higger',
     // Racial slurs - Asian
     'chink', 'gook', 'nip', 'zipperhead', 'slope', 'squinty',
     // Racial slurs - Hispanic/Latino
@@ -67,7 +68,7 @@ function censorText(input, options = {}) {
     // Racial slurs - White
     'cracker', 'honky', 'whitey', 'gringo', 'haole', 'powderskin',
     // Homophobic/transphobic slurs
-    'fag', 'faggot', 'dyke', 'tranny', 'shemale',
+    'fag', 'faggot', 'dyke', 'tranny', 'shemale', 'femboy', 'femboi', 'twinknocker',
     // Ableist slurs
     'retard', 'spaz', 'mongo', 'tard',
     // Romani slurs
@@ -78,16 +79,20 @@ function censorText(input, options = {}) {
     'wop', 'dago', 'guinea',
     // Polish slurs
     'polack',
+    // Sexist Slurs
+    'bimbo', 
     // Unique Slurs
-    'higer', 'higger', 'deez nutz', 'deez nuts', 'deezy nutz', 'deezy nuts', 
+    'deez nutz', 'deez nuts', 'deezy nutz', 'deezy nuts', 
     '67', 'six seven', '6 seven', 'six 7', 'f them', 'nig', 'kill', 'willy wigger', 
     'igga', 'niqqa', 'kys', 'niga', 'nosecandy', 'grandwizard', 'noob',
-    'boing', 'twinknocker', 'crotch', 'wap'
+    'boing', 'crotch', 'wap', 'god damn it',
   ]).map(w => w.toLowerCase());
 
   const exceptions = (options.exceptions || [
-    'classroom', 'assistant', 'glass', 'passage', 'compassion', 'grass', 'passport', 'hello', 'shell', 'bells',
-    'assess', 'assignment', 'assumption', 'bass', 'mass', 'pass', 
+    'classroom', 'assistant', 'glass', 'passage', 'compassion', 'grass', 'passport', 
+    'hello', 'shell', 'bells', 'assess', 'assignment', 'assumption', 'bass', 'mass', 
+    'pass', 'assistant', 'brass', 'class', 'hassle', 'lasso', 'massage', 'passable', 
+    'sassy', 'tassel', 'casserole', 'embarrass', 'harass', 'jazz', 'razz', 'sass', 'vassal'
   ]).map(e => e.toLowerCase());
 
   const leetMap = options.leetMap || DEFAULT_LEET_MAP;

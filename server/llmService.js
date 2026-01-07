@@ -13,7 +13,7 @@ class LLMService {
       return base.replace(/\/$/, '');
     };
 
-    const manualHosts = ['192.168.1.54'];
+    const manualHosts = ['localhost'];
     const manualBases = manualHosts.map(h => normalizeBase(h)).filter(Boolean);
     const envHosts = process.env.OLLAMA_HOSTS
       ? process.env.OLLAMA_HOSTS.split(',').map(h => normalizeBase(h)).filter(Boolean)
@@ -26,7 +26,7 @@ class LLMService {
     const modelListFromEnv = process.env.LLM_MODELS
       ? process.env.LLM_MODELS.split(',').map(m => m.trim()).filter(Boolean)
       : null;
-    this.modelCandidates = modelListFromEnv || ['gemma3:270m', 'antconsales/antonio-gemma3-evo-q4'];
+    this.modelCandidates = modelListFromEnv || ['antconsales/antonio-gemma3-evo-q4'];
     this.modelName = modelFromEnv || 'antconsales/antonio-gemma3-evo-q4';
 
     this.generator = null;

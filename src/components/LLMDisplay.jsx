@@ -5,6 +5,11 @@ const LLMDisplay = ({ gameState }) => {
   // This ensures the animation restarts whenever new Q&A pairs are added
   const animationKey = `${gameState?.trainingData?.length || 0}-${gameState?.llmKnowledge?.length || 0}`;
   
+  // Calculate animation duration based on number of items
+  // ~5 seconds per item to maintain consistent scroll speed
+  const itemCount = gameState?.llmKnowledge?.length || 0;
+  const animationDuration = Math.max(15, itemCount * 5); // Minimum 15s, scales with items
+  
   return (
     <div className="card" style={{ 
       padding: '20px',
@@ -77,10 +82,10 @@ const LLMDisplay = ({ gameState }) => {
               transform: translateY(-50%);
             }
           }
-          .knowledge-scroll {
-            animation: scrollKnowledge 30s linear infinite;
+          .knowledge-scroll-${itemCount} {
+            animation: scrollKnowledge ${animationDuration}s linear infinite;
           }
-          .knowledge-scroll:hover {
+          .knowledge-scroll-${itemCount}:hover {
             animation-play-state: paused;
           }
         `}
@@ -115,7 +120,7 @@ const LLMDisplay = ({ gameState }) => {
           }}>
             <div 
               key={animationKey}
-              className="knowledge-scroll" 
+              className={`knowledge-scroll-${itemCount}`} 
               style={{
                 display: 'flex',
                 flexDirection: 'column',
