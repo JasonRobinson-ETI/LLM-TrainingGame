@@ -1,0 +1,2 @@
+FROM antconsales/antonio-gemma3-evo-q4
+PARAMETER num_ctx 8192

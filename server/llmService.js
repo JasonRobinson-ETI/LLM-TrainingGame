@@ -15,7 +15,7 @@ class LLMService {
       return base.replace(/\/$/, '');
     };
 
-    const manualHosts = ['192.168.1.68', '192.168.68.25', '192.168.68.10'];
+    const manualHosts = ['192.168.1.68', '192.168.68.25', '192.168.68.10',];
     
     // Combine manual, env, and local hosts into a unique set
     const bases = new Set();
@@ -41,8 +41,8 @@ class LLMService {
     const modelListFromEnv = process.env.LLM_MODELS
       ? process.env.LLM_MODELS.split(',').map(m => m.trim()).filter(Boolean)
       : null;
-    this.modelCandidates = modelListFromEnv || ['antconsales/antonio-gemma3-evo-q4'];
-    this.modelName = modelFromEnv || 'antconsales/antonio-gemma3-evo-q4';
+    this.modelCandidates = modelListFromEnv || ['antonio-max-ctx'];
+    this.modelName = modelFromEnv || 'antonio-max-ctx';
 
     this.generator = null;
     this.isInitialized = false;
@@ -193,21 +193,29 @@ class LLMService {
     }
   }
 
-  buildContext(trainingData, llmKnowledge) {
+  buildContext(trainingData, llmKnowledge, maxItems = 20) {
+    // Sliding window: use only the most recent items to stay within context limits
     const contextParts = [];
+    
     if (llmKnowledge && llmKnowledge.length > 0) {
       contextParts.push('Knowledge base:');
-      llmKnowledge.forEach((knowledge, idx) => {
+      // Take the most recent knowledge items
+      const recentKnowledge = llmKnowledge.slice(-maxItems);
+      recentKnowledge.forEach((knowledge, idx) => {
         contextParts.push(`${idx + 1}. ${knowledge}`);
       });
     }
+    
     if (trainingData && trainingData.length > 0) {
       contextParts.push('\nTraining examples:');
-      trainingData.forEach((data) => {
+      // Take the most recent training examples
+      const recentTraining = trainingData.slice(-maxItems);
+      recentTraining.forEach((data) => {
         contextParts.push(`Q: ${data.question}`);
         contextParts.push(`A: ${data.answer}`);
       });
     }
+    
     return contextParts.join('\n');
   }
 

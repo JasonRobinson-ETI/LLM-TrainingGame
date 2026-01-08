@@ -1262,8 +1262,9 @@ function sendToClient(clientId, message) {
 }
 
 const PORT = 3001;
-server.listen(PORT, '0.0.0.0', async () => {
-  const localIP = getLocalIP();
+const HOST = '0.0.0.0'; // Listen on all interfaces
+const localIP = getLocalIP();
+server.listen(PORT, HOST, async () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Local network access: http://${localIP}:${PORT}`);
   console.log(`WebSocket access: ws://${localIP}:${PORT}`);
