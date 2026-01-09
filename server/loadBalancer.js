@@ -18,6 +18,14 @@ class LoadBalancer {
     this.avgTokensPerRequest = 50; // Running average for estimation
     this.complexityCache = new Map(); // Cache for complexity analysis results
     this.cacheMaxSize = 1000; // Limit cache size to prevent memory issues
+    
+    // Work-stealing / dynamic rebalancing
+    this.rebalanceEnabled = true;
+    this.rebalanceIntervalMs = 2000; // Check every 2 seconds
+    this.rebalanceInterval = null;
+    this.completionTimes = {}; // Track recent completion times per device
+    this.completionWindow = 10; // Keep last N completions for rate calculation
+    this.minStealThreshold = 2; // Only steal if source queue has at least this many items
   }
 
   /**
@@ -500,6 +508,212 @@ class LoadBalancer {
    */
   getOnlineDevices() {
     return Array.from(this.onlineDevices);
+  }
+
+  // ==================== WORK-STEALING / QUEUE REBALANCING ====================
+
+  /**
+   * Record a completion time for a device (for tracking real-time processing speed)
+   * @param {string} base - Device base URL
+   * @param {number} durationMs - Time taken to complete the request in milliseconds
+   */
+  recordCompletion(base, durationMs) {
+    if (!this.completionTimes[base]) {
+      this.completionTimes[base] = [];
+    }
+    
+    this.completionTimes[base].push({
+      time: Date.now(),
+      duration: durationMs
+    });
+    
+    // Keep only recent completions
+    if (this.completionTimes[base].length > this.completionWindow) {
+      this.completionTimes[base].shift();
+    }
+  }
+
+  /**
+   * Calculate real-time processing rate for a device (requests per minute)
+   * @param {string} base - Device base URL
+   * @returns {number} Requests per minute (0 if no data)
+   */
+  getProcessingRate(base) {
+    const completions = this.completionTimes[base];
+    if (!completions || completions.length < 2) {
+      // Fall back to TPS-based estimate
+      const tps = this.deviceTPS[base] || 0;
+      return tps > 0 ? (tps / this.avgTokensPerRequest) * 60 : 0;
+    }
+    
+    // Calculate rate from recent completions
+    const oldest = completions[0].time;
+    const newest = completions[completions.length - 1].time;
+    const timeSpanMs = newest - oldest;
+    
+    if (timeSpanMs < 1000) return 0; // Not enough data
+    
+    const requestsPerMinute = (completions.length / timeSpanMs) * 60000;
+    return requestsPerMinute;
+  }
+
+  /**
+   * Get average completion time for a device
+   * @param {string} base - Device base URL
+   * @returns {number} Average completion time in ms (Infinity if no data)
+   */
+  getAvgCompletionTime(base) {
+    const completions = this.completionTimes[base];
+    if (!completions || completions.length === 0) {
+      // Estimate from TPS
+      const tps = this.deviceTPS[base] || 0;
+      if (tps <= 0) return Infinity;
+      return (this.avgTokensPerRequest / tps) * 1000;
+    }
+    
+    const totalDuration = completions.reduce((sum, c) => sum + c.duration, 0);
+    return totalDuration / completions.length;
+  }
+
+  /**
+   * Start the automatic rebalancing interval
+   * @param {Object} deviceQueues - Reference to the device queues from LLMService
+   * @param {Function} processQueueFn - Function to call to process a queue after stealing
+   */
+  startRebalancing(deviceQueues, processQueueFn) {
+    if (this.rebalanceInterval) {
+      clearInterval(this.rebalanceInterval);
+    }
+    
+    console.log('[LoadBalancer] Starting work-stealing rebalancer (every 2s)');
+    
+    this.rebalanceInterval = setInterval(() => {
+      if (this.rebalanceEnabled) {
+        this.rebalanceQueues(deviceQueues, processQueueFn);
+      }
+    }, this.rebalanceIntervalMs);
+  }
+
+  /**
+   * Stop the automatic rebalancing
+   */
+  stopRebalancing() {
+    if (this.rebalanceInterval) {
+      clearInterval(this.rebalanceInterval);
+      this.rebalanceInterval = null;
+      console.log('[LoadBalancer] Stopped work-stealing rebalancer');
+    }
+  }
+
+  /**
+   * Rebalance queues by stealing work from slow/overloaded devices to fast/idle ones
+   * @param {Object} deviceQueues - Map of base -> queue array
+   * @param {Function} processQueueFn - Function to process queue after stealing
+   */
+  rebalanceQueues(deviceQueues, processQueueFn) {
+    const onlineDevices = this.getOnlineDevices();
+    if (onlineDevices.length < 2) return; // Need at least 2 devices to rebalance
+    
+    // Calculate queue info with estimated completion times
+    const queueInfo = onlineDevices.map(base => {
+      const queueSize = deviceQueues[base]?.length || 0;
+      const avgTime = this.getAvgCompletionTime(base);
+      const estimatedWait = queueSize * avgTime;
+      const rate = this.getProcessingRate(base);
+      
+      return {
+        base,
+        queueSize,
+        avgTime,
+        estimatedWait,
+        rate,
+        tps: this.deviceTPS[base] || 0
+      };
+    });
+    
+    // Sort by estimated wait time (longest first = potential source for stealing)
+    queueInfo.sort((a, b) => b.estimatedWait - a.estimatedWait);
+    
+    // Find candidates for stealing FROM (slow/overloaded)
+    const stealFrom = queueInfo.filter(q => q.queueSize >= this.minStealThreshold);
+    
+    // Find candidates for stealing TO (fast/idle)
+    const stealTo = queueInfo.filter(q => q.queueSize === 0 && q.tps > 0);
+    
+    if (stealFrom.length === 0 || stealTo.length === 0) return;
+    
+    // Perform work stealing
+    let stolen = 0;
+    for (const target of stealTo) {
+      for (const source of stealFrom) {
+        // Don't steal from faster devices to slower ones
+        if (source.tps >= target.tps * 0.8) continue; // Source is nearly as fast, skip
+        
+        // Only steal if source has significantly more estimated wait
+        if (source.estimatedWait < target.avgTime * 2) continue;
+        
+        // Steal one request
+        if (deviceQueues[source.base].length >= this.minStealThreshold) {
+          const request = deviceQueues[source.base].pop(); // Take from end (LIFO for fairness)
+          if (request) {
+            deviceQueues[target.base].push(request);
+            stolen++;
+            
+            console.log(
+              `[LoadBalancer] 🔄 Work stolen: ${source.base.split('//')[1]} -> ${target.base.split('//')[1]} ` +
+              `(source queue: ${source.queueSize - 1}, target faster by ${((target.tps / source.tps - 1) * 100).toFixed(0)}%)`
+            );
+            
+            // Trigger processing on target
+            if (processQueueFn) {
+              setImmediate(() => processQueueFn(target.base));
+            }
+            
+            // Update queue sizes for next iteration
+            source.queueSize--;
+            target.queueSize++;
+            
+            // Only steal one per target per cycle
+            break;
+          }
+        }
+      }
+    }
+    
+    if (stolen > 0) {
+      console.log(`[LoadBalancer] Rebalanced ${stolen} request(s)`);
+    }
+  }
+
+  /**
+   * Enable or disable automatic rebalancing
+   * @param {boolean} enabled
+   */
+  setRebalancingEnabled(enabled) {
+    this.rebalanceEnabled = enabled;
+    console.log(`[LoadBalancer] Work-stealing: ${enabled ? 'ENABLED' : 'DISABLED'}`);
+  }
+
+  /**
+   * Get rebalancing statistics
+   * @param {Object} deviceQueues - Current device queues
+   * @returns {Object} Stats about queue balance
+   */
+  getRebalanceStats(deviceQueues) {
+    const onlineDevices = this.getOnlineDevices();
+    const stats = onlineDevices.map(base => ({
+      device: base,
+      queueSize: deviceQueues[base]?.length || 0,
+      avgCompletionMs: Math.round(this.getAvgCompletionTime(base)),
+      processingRate: this.getProcessingRate(base).toFixed(1),
+      tps: this.deviceTPS[base]?.toFixed(1) || '0'
+    }));
+    
+    return {
+      enabled: this.rebalanceEnabled,
+      devices: stats,
+      totalQueued: stats.reduce((sum, s) => sum + s.queueSize, 0)
+    };
   }
 }
 

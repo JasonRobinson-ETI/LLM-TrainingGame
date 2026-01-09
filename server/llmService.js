@@ -235,6 +235,13 @@ class LLMService {
       if (activeBases.length > 0) {
         this.isInitialized = true;
         console.log(`[LLM] Initialization complete. ${activeBases.length} active devices ready.`);
+        
+        // Start work-stealing rebalancer
+        this.loadBalancer.startRebalancing(
+          this.deviceQueues,
+          (base) => this.processDeviceQueue(base)
+        );
+        
         return;
       }
 
@@ -385,6 +392,7 @@ class LLMService {
     }
     
     const { question, trainingData, llmKnowledge, resolve, reject } = request;
+    const startTime = Date.now(); // Track completion time for work-stealing
     
     console.log(`[LLM] Processing request on ${base} (active: ${this.deviceBusy[base]}, queue: ${this.deviceQueues[base].length} remaining)`);
     
@@ -399,6 +407,11 @@ class LLMService {
       const response = this.useOllama
         ? await this.generateWithOllamaOnDevice(base, question, context)
         : await this.generateWithTransformers(question, context);
+      
+      // Record completion time for work-stealing algorithm
+      const durationMs = Date.now() - startTime;
+      this.loadBalancer.recordCompletion(base, durationMs);
+      
       resolve(response);
     } catch (error) {
       console.error('[LLM] Error generating response on', base, ':', error.message);
@@ -596,8 +609,25 @@ class LLMService {
     return {
       useGreedy: this.loadBalancer.useGreedy,
       tpsPerPerson: this.loadBalancer.tpsPerPerson,
-      avgTokensPerRequest: this.loadBalancer.avgTokensPerRequest
+      avgTokensPerRequest: this.loadBalancer.avgTokensPerRequest,
+      rebalanceEnabled: this.loadBalancer.rebalanceEnabled
     };
+  }
+
+  /**
+   * Enable or disable work-stealing rebalancing
+   * @param {boolean} enabled - Enable or disable rebalancing
+   */
+  setRebalancingEnabled(enabled) {
+    this.loadBalancer.setRebalancingEnabled(enabled);
+  }
+
+  /**
+   * Get work-stealing rebalance statistics
+   * @returns {Object} Stats about queue balance and processing rates
+   */
+  getRebalanceStats() {
+    return this.loadBalancer.getRebalanceStats(this.deviceQueues);
   }
 
   /**
