@@ -49,6 +49,21 @@ class LoadBalancer {
   }
 
   /**
+   * Get dynamic max concurrent requests for a device based on its TPS
+   * Formula: TPS / 100, with min of 1 and max of 8
+   * @param {string} base - Device base URL
+   * @returns {number} Max concurrent requests allowed for this device
+   */
+  getMaxConcurrent(base) {
+    const tps = this.deviceTPS[base] || 0;
+    if (tps <= 0) return 1; // Minimum 1 for offline/unknown devices
+    
+    const concurrent = Math.floor(tps / 100);
+    // Clamp between 1 and 8
+    return Math.max(1, Math.min(8, concurrent));
+  }
+
+  /**
    * Update device rankings and capacities based on benchmark results
    * @param {Array} devices - Array of {base, tps} objects
    */
@@ -191,14 +206,18 @@ class LoadBalancer {
    * Calculate expected completion time for a device (greedy algorithm)
    * @param {string} base - Device base URL
    * @param {number} queueSize - Current queue size
+   * @param {number} activeRequests - Currently processing requests (busy count)
    * @param {number} estimatedTokens - Tokens needed for new request
    * @returns {number} Expected completion time in seconds
    */
-  calculateCompletionTime(base, queueSize, estimatedTokens) {
+  calculateCompletionTime(base, queueSize, activeRequests, estimatedTokens) {
     const tps = this.deviceTPS[base] || 1;
     
-    // Time for current queue (assume average tokens per request)
-    const queueTime = (queueSize * this.avgTokensPerRequest) / tps;
+    // Total pending work = queued + active requests
+    const totalPending = queueSize + (activeRequests || 0);
+    
+    // Time for current queue + active (assume average tokens per request)
+    const queueTime = (totalPending * this.avgTokensPerRequest) / tps;
     
     // Time for new request
     const requestTime = estimatedTokens / tps;
@@ -212,7 +231,7 @@ class LoadBalancer {
    * Randomly samples 2 devices and picks the less loaded one
    * Used by Netflix, NGINX, and HAProxy to avoid hotspots
    * @param {Object} deviceQueues - Map of base -> queue array
-   * @param {Object} deviceBusy - Map of base -> boolean
+   * @param {Object} deviceBusy - Map of base -> number (active request count)
    * @param {number} estimatedTokens - Estimated tokens for the request
    * @returns {string|null} Base URL of selected device
    */
@@ -221,8 +240,10 @@ class LoadBalancer {
       .filter(base => {
         if (!this.isOnline(base)) return false;
         const queueSize = deviceQueues[base]?.length || 0;
+        const activeCount = deviceBusy[base] || 0;
         const capacity = this.deviceCapacities[base] || 1;
-        return queueSize < capacity; // Only consider devices with capacity
+        // Consider both queue AND active requests for capacity check
+        return (queueSize + activeCount) < (capacity + this.getMaxConcurrent(base));
       });
 
     if (availableBases.length === 0) {
@@ -245,20 +266,22 @@ class LoadBalancer {
     const device1 = availableBases[idx1];
     const device2 = availableBases[idx2];
 
-    // Calculate expected completion time for both
+    // Calculate expected completion time for both (including active requests)
     const queueSize1 = deviceQueues[device1]?.length || 0;
     const queueSize2 = deviceQueues[device2]?.length || 0;
+    const active1 = deviceBusy[device1] || 0;
+    const active2 = deviceBusy[device2] || 0;
     
-    const completionTime1 = this.calculateCompletionTime(device1, queueSize1, estimatedTokens);
-    const completionTime2 = this.calculateCompletionTime(device2, queueSize2, estimatedTokens);
+    const completionTime1 = this.calculateCompletionTime(device1, queueSize1, active1, estimatedTokens);
+    const completionTime2 = this.calculateCompletionTime(device2, queueSize2, active2, estimatedTokens);
 
     // Pick the less loaded one
     const selected = completionTime1 <= completionTime2 ? device1 : device2;
     const rejected = completionTime1 <= completionTime2 ? device2 : device1;
 
     console.log(
-      `[LoadBalancer] Power of Two: sampled ${device1.split('//')[1]} (${completionTime1.toFixed(2)}s) ` +
-      `vs ${device2.split('//')[1]} (${completionTime2.toFixed(2)}s) → chose ${selected.split('//')[1]}`
+      `[LoadBalancer] Power of Two: ${device1.split('//')[1]} (q:${queueSize1}+a:${active1}=${completionTime1.toFixed(2)}s) ` +
+      `vs ${device2.split('//')[1]} (q:${queueSize2}+a:${active2}=${completionTime2.toFixed(2)}s) → ${selected.split('//')[1]}`
     );
 
     return selected;
@@ -268,7 +291,7 @@ class LoadBalancer {
    * Select best device using greedy algorithm
    * Chooses device with minimum expected completion time
    * @param {Object} deviceQueues - Map of base -> queue array
-   * @param {Object} deviceBusy - Map of base -> boolean
+   * @param {Object} deviceBusy - Map of base -> number (active request count)
    * @param {number} estimatedTokens - Estimated tokens for the request
    * @returns {string|null} Base URL of optimal device
    */
@@ -282,18 +305,20 @@ class LoadBalancer {
 
     for (const base of sortedBases) {
       const queueSize = deviceQueues[base]?.length || 0;
+      const activeCount = deviceBusy[base] || 0;
       const capacity = this.deviceCapacities[base] || 1;
+      const maxConcurrent = this.getMaxConcurrent(base);
 
-      // Skip if at capacity
-      if (queueSize >= capacity) continue;
+      // Skip if at capacity (queue + active >= capacity + maxConcurrent)
+      if ((queueSize + activeCount) >= (capacity + maxConcurrent)) continue;
 
-      // Calculate expected completion time
-      const completionTime = this.calculateCompletionTime(base, queueSize, estimatedTokens);
+      // Calculate expected completion time (including active requests)
+      const completionTime = this.calculateCompletionTime(base, queueSize, activeCount, estimatedTokens);
 
       // Prefer faster completion time
-      // Tie-breaker: prefer idle devices
+      // Tie-breaker: prefer devices with fewer active requests
       if (completionTime < minCompletionTime || 
-          (completionTime === minCompletionTime && !deviceBusy[base])) {
+          (completionTime === minCompletionTime && activeCount < (deviceBusy[bestDevice] || 0))) {
         minCompletionTime = completionTime;
         bestDevice = base;
       }
@@ -301,9 +326,10 @@ class LoadBalancer {
 
     if (bestDevice) {
       const tps = this.deviceTPS[bestDevice]?.toFixed(1) || '?';
+      const active = deviceBusy[bestDevice] || 0;
       console.log(
         `[LoadBalancer] Greedy selection: ${bestDevice} ` +
-        `(completion time: ${minCompletionTime.toFixed(2)}s, TPS: ${tps})`
+        `(completion time: ${minCompletionTime.toFixed(2)}s, TPS: ${tps}, active: ${active})`
       );
     }
 
@@ -591,6 +617,40 @@ class LoadBalancer {
       this.deviceTPS[base] = tps;
       this.deviceCapacities[base] = this.calculateCapacity(tps);
       console.log(`[LoadBalancer] Device came online: ${base} (TPS: ${tps.toFixed(2)})`);
+    }
+  }
+
+  /**
+   * Update a device's TPS based on actual inference performance
+   * Uses exponential moving average to blend with existing TPS
+   * @param {string} base - Device base URL
+   * @param {number} actualTPS - Measured TPS from inference
+   */
+  updateDeviceTPS(base, actualTPS) {
+    if (!this.onlineDevices.has(base) || actualTPS <= 0) return;
+    
+    const oldTPS = this.deviceTPS[base] || actualTPS;
+    // Exponential moving average (α=0.3 for smooth updates)
+    const alpha = 0.3;
+    const newTPS = alpha * actualTPS + (1 - alpha) * oldTPS;
+    
+    // Only log significant changes (>10% delta)
+    const percentChange = Math.abs(newTPS - oldTPS) / oldTPS * 100;
+    if (percentChange > 10) {
+      const oldConcurrent = this.getMaxConcurrent(base);
+      this.deviceTPS[base] = newTPS;
+      this.deviceCapacities[base] = this.calculateCapacity(newTPS);
+      const newConcurrent = this.getMaxConcurrent(base);
+      
+      console.log(
+        `[LoadBalancer] TPS updated for ${base.split('//')[1]}: ` +
+        `${oldTPS.toFixed(1)} → ${newTPS.toFixed(1)} TPS ` +
+        `(maxConcurrent: ${oldConcurrent} → ${newConcurrent})`
+      );
+    } else {
+      // Silently update
+      this.deviceTPS[base] = newTPS;
+      this.deviceCapacities[base] = this.calculateCapacity(newTPS);
     }
   }
 

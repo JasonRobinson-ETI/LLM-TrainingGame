@@ -36,6 +36,7 @@ app.get('/api/devices', (req, res) => {
     queueSize: llmService.deviceQueues[base]?.length || 0,
     busy: llmService.deviceBusy[base] || 0,
     tps: llmService.devicePerformance[base]?.tps || 0,
+    maxConcurrent: llmService.loadBalancer.getMaxConcurrent(base),
     model: llmService.devicePerformance[base]?.model || llmService.modelName,
     acceleration: llmService.devicePerformance[base]?.acceleration || 'unknown'
   }));

@@ -375,8 +375,8 @@ class LLMService {
   }
 
   async processDeviceQueue(base) {
-    // Allow up to 2 concurrent requests per device for better throughput
-    const maxConcurrent = 2;
+    // Dynamic max concurrent based on device TPS (TPS/100, clamped 1-8)
+    const maxConcurrent = this.loadBalancer.getMaxConcurrent(base);
     const currentActive = this.deviceBusy[base] || 0;
     
     if (currentActive >= maxConcurrent || this.deviceQueues[base].length === 0) return;
@@ -394,7 +394,7 @@ class LLMService {
     const { question, trainingData, llmKnowledge, resolve, reject } = request;
     const startTime = Date.now(); // Track completion time for work-stealing
     
-    console.log(`[LLM] Processing request on ${base} (active: ${this.deviceBusy[base]}, queue: ${this.deviceQueues[base].length} remaining)`);
+    console.log(`[LLM] Processing request on ${base} (active: ${this.deviceBusy[base]}/${maxConcurrent}, queue: ${this.deviceQueues[base].length} remaining)`);
     
     // Start processing next request immediately if capacity available
     if (this.deviceQueues[base].length > 0 && this.deviceBusy[base] < maxConcurrent) {
@@ -507,6 +507,14 @@ class LLMService {
       // Update load balancer's average token count if available
       if (data.eval_count) {
         this.loadBalancer.updateAverageTokens(data.eval_count);
+        
+        // Update real-time TPS based on actual inference performance
+        // eval_duration is in nanoseconds
+        if (data.eval_duration && data.eval_duration > 0) {
+          const durationSec = data.eval_duration / 1e9;
+          const actualTPS = data.eval_count / durationSec;
+          this.loadBalancer.updateDeviceTPS(base, actualTPS);
+        }
       }
       
       let answer = (data.response || (data.message && data.message.content) || '').trim();
