@@ -50,7 +50,8 @@ class LoadBalancer {
 
   /**
    * Get dynamic max concurrent requests for a device based on its TPS
-   * Formula: TPS / 100, with min of 1 and max of 8
+   * Devices below 50 TPS handle 1 request at a time
+   * Devices at 50+ TPS handle 2 concurrent requests
    * @param {string} base - Device base URL
    * @returns {number} Max concurrent requests allowed for this device
    */
@@ -58,9 +59,8 @@ class LoadBalancer {
     const tps = this.deviceTPS[base] || 0;
     if (tps <= 0) return 1; // Minimum 1 for offline/unknown devices
     
-    const concurrent = Math.floor(tps / 100);
-    // Clamp between 1 and 8
-    return Math.max(1, Math.min(8, concurrent));
+    // Simple threshold: < 50 TPS = 1 concurrent, >= 50 TPS = 2 concurrent
+    return tps < 50 ? 1 : 2;
   }
 
   /**
