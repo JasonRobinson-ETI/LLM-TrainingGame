@@ -1,9 +1,11 @@
 import si from 'systeminformation';
+import LoadBalancer from './loadBalancer.js';
 
 class LLMService {
   constructor() {
     this.useOllama = true;
     this.modelChangeCallback = null; // Callback for when model changes
+    this.loadBalancer = new LoadBalancer(100); // 100 TPS per person ratio
     const requiredEnv = (process.env.OLLAMA_REQUIRED || 'true').toLowerCase();
     this.requireOllama = requiredEnv === '1' || requiredEnv === 'true' || requiredEnv === 'yes';
 
@@ -15,7 +17,7 @@ class LLMService {
       return base.replace(/\/$/, '');
     };
 
-    const manualHosts = ['192.168.1.68', '192.168.68.25', '192.168.68.10',];
+    const manualHosts = ['192.168.68.25', '192.168.68.10', '192.168.68.12',];
     
     // Combine manual, env, and local hosts into a unique set
     const bases = new Set();
@@ -47,15 +49,22 @@ class LLMService {
     this.generator = null;
     this.isInitialized = false;
     this.initializationPromise = null;
+    this.hasMetalAcceleration = false; // Detected during hardware info
+    this.localHardwareInfo = null; // Store local hardware detection results
 
     // Initialize per-device queues and busy flags
     this.deviceQueues = {};
     this.deviceBusy = {};
-    this.devicePerformance = {}; // Track TPS for each device
+    this.devicePerformance = {}; // Track TPS and hardware info for each device
     this.ollamaBases.forEach(base => {
       this.deviceQueues[base] = [];
       this.deviceBusy[base] = false;
-      this.devicePerformance[base] = { tps: 0, model: 'unknown' };
+      this.devicePerformance[base] = { 
+        tps: 0, 
+        model: 'unknown',
+        acceleration: 'unknown', // 'metal', 'cuda', 'cpu'
+        hardware: null // Detailed hardware info
+      };
     });
     // Track last used device for round-robin
     this.lastDeviceIndex = -1;
@@ -64,17 +73,86 @@ class LLMService {
   async getHardwareInfo() {
     try {
       console.log('[LLM] Detecting local hardware...');
+      const cpu = await si.cpu();
+      console.log(`[LLM] CPU: ${cpu.manufacturer} ${cpu.brand} (${cpu.cores} cores)`);
+      
+      // Detect Apple Silicon for Metal acceleration
+      const isAppleSilicon = cpu.manufacturer === 'Apple' || cpu.brand.includes('M1') || cpu.brand.includes('M2') || cpu.brand.includes('M3');
+      if (isAppleSilicon) {
+        console.log('[LLM] ✓ Apple Silicon detected - Metal acceleration available');
+        console.log('[LLM] ✓ Neural Engine (ANE) available for inference');
+        this.hasMetalAcceleration = true;
+      }
+      
       const gpuData = await si.graphics();
       if (gpuData.controllers.length > 0) {
         console.log('[LLM] Detected GPUs/MPUs:');
         gpuData.controllers.forEach((ctrl, idx) => {
-          console.log(`  ${idx + 1}. ${ctrl.model} (VRAM: ${ctrl.vram}MB)`);
+          console.log(`  ${idx + 1}. ${ctrl.model} (VRAM: ${ctrl.vram || 'Unified'}MB)`);
         });
       }
-      const cpu = await si.cpu();
-      console.log(`[LLM] CPU: ${cpu.manufacturer} ${cpu.brand} (${cpu.cores} cores)`);
+      
+      this.localHardwareInfo = {
+        isAppleSilicon,
+        cpu: `${cpu.manufacturer} ${cpu.brand}`,
+        cores: cpu.cores,
+        gpus: gpuData.controllers.map(ctrl => ctrl.model)
+      };
     } catch (err) {
       console.warn('[LLM] Hardware detection failed:', err.message);
+    }
+  }
+
+  async detectDeviceAcceleration(base) {
+    // Try to detect what acceleration is being used by this Ollama instance
+    const isLocalhost = base.includes('localhost') || base.includes('127.0.0.1');
+    const tps = this.devicePerformance[base]?.tps || 0;
+    
+    try {
+      // Use /api/ps to see running models and their GPU layers
+      const psRes = await fetch(`${base}/api/ps`, { method: 'GET' });
+      if (psRes.ok) {
+        const psData = await psRes.json();
+        // Check if any model is using GPU layers
+        if (psData.models && psData.models.length > 0) {
+          const model = psData.models[0];
+          const details = model.details || {};
+          
+          // Check for GPU usage indicators
+          if (details.gpu_layers && details.gpu_layers > 0) {
+            // Determine type based on local hardware detection
+            if (isLocalhost && this.hasMetalAcceleration) {
+              return 'metal';
+            }
+            // For remote devices, be conservative - only say CUDA if very high performance
+            if (!isLocalhost && tps > 50) {
+              return 'cuda';
+            }
+            return 'gpu';
+          }
+        }
+      }
+      
+      // Fallback: infer from TPS and local hardware info
+      if (isLocalhost && this.hasMetalAcceleration && tps > 5) {
+        return 'metal';
+      } else if (tps > 50) {
+        // Only report CUDA for very high TPS (50+ tokens/sec)
+        return 'cuda';
+      } else if (tps > 10) {
+        // Moderate TPS - generic GPU
+        return 'gpu';
+      }
+      
+      return 'cpu';
+    } catch (err) {
+      // If /api/ps fails, infer conservatively from TPS and hostname
+      if (isLocalhost && this.hasMetalAcceleration && tps > 5) {
+        return 'metal';
+      }
+      if (tps > 50) return 'cuda';
+      if (tps > 10) return 'gpu';
+      return 'cpu';
     }
   }
 
@@ -88,7 +166,12 @@ class LLMService {
           model: this.modelName,
           prompt: "Verify 1+1",
           stream: false,
-          options: { num_predict: 10, temperature: 0 }
+          options: { 
+            num_predict: 10, 
+            temperature: 0,
+            num_gpu: 99,  // Use all available GPU layers (Metal on Mac)
+            f16_kv: true  // Use half-precision for key/value cache (faster on Metal)
+          }
         }),
       });
 
@@ -101,11 +184,19 @@ class LLMService {
       const tps = data.eval_count ? (data.eval_count / durationSec) : 0;
       
       this.devicePerformance[base].tps = tps;
-      console.log(`[LLM] Result ${base}: ${tps.toFixed(2)} TPS`);
+      this.devicePerformance[base].model = this.modelName;
+      
+      // Detect acceleration type
+      const acceleration = await this.detectDeviceAcceleration(base);
+      this.devicePerformance[base].acceleration = acceleration;
+      
+      const accelEmoji = acceleration === 'metal' ? '🍎' : acceleration === 'cuda' ? '🟢' : acceleration === 'gpu' ? '🔵' : '⚪';
+      console.log(`[LLM] Result ${base}: ${tps.toFixed(2)} TPS ${accelEmoji} ${acceleration.toUpperCase()}`);
       return tps;
     } catch (err) {
       console.warn(`[LLM] Benchmark failed for ${base}: ${err.message}`);
       this.devicePerformance[base].tps = 0;
+      this.devicePerformance[base].acceleration = 'offline';
       return 0;
     }
   }
@@ -130,6 +221,14 @@ class LLMService {
         const perf = this.devicePerformance[base];
         console.log(`  ${idx + 1}. ${base} - ${perf.tps.toFixed(2)} TPS`);
       });
+
+      // Update load balancer with device metrics
+      const deviceMetrics = this.ollamaBases.map(base => ({
+        base,
+        tps: this.devicePerformance[base].tps
+      }));
+      const summary = this.loadBalancer.updateDeviceMetrics(deviceMetrics);
+      console.log(`[LLM] Load Balancer: ${summary.totalCapacity} total queue slots across ${summary.devices} devices`);
 
       // Verification: Check if at least one works
       const activeBases = this.ollamaBases.filter(b => this.devicePerformance[b].tps > 0);
@@ -193,7 +292,7 @@ class LLMService {
     }
   }
 
-  buildContext(trainingData, llmKnowledge, maxItems = 20) {
+  buildContext(trainingData, llmKnowledge, maxItems = 100) {
     // Sliding window: use only the most recent items to stay within context limits
     const contextParts = [];
     
@@ -220,37 +319,44 @@ class LLMService {
   }
 
   async generateResponse(question, trainingData = [], llmKnowledge = []) {
-    return new Promise((resolve) => {
-      const request = { question, trainingData, llmKnowledge, resolve };
+    return new Promise((resolve, reject) => {
+      const request = { question, trainingData, llmKnowledge, resolve, reject };
       
-      // Smart Routing: Prefer fastest idle device
-      let selectedBase = null;
+      // Use load balancer to select best device based on question complexity
+      let selectedBase = this.loadBalancer.selectBestDevice(
+        this.deviceQueues,
+        this.deviceBusy,
+        question  // Pass question for complexity analysis
+      );
       
-      // 1. Try to find the highest-ranked idle device
-      for (const base of this.ollamaBases) {
-        if (!this.deviceBusy[base]) {
-          selectedBase = base;
-          break;
-        }
-      }
-      
-      // 2. If all busy, pick the one with the shortest queue (load balancing)
-      //    Tie-breaker goes to the one appearing earlier in the sorted list (higher TPS)
       if (!selectedBase) {
-        let minQueue = Infinity;
-        for (const base of this.ollamaBases) {
-          if (this.deviceQueues[base].length < minQueue) {
-            minQueue = this.deviceQueues[base].length;
-            selectedBase = base;
+        // Fallback: find any online device with shortest queue
+        const onlineDevices = this.loadBalancer.getOnlineDevices();
+        
+        if (onlineDevices.length > 0) {
+          let minQueueSize = Infinity;
+          for (const base of onlineDevices) {
+            if (this.deviceQueues[base].length < minQueueSize) {
+              minQueueSize = this.deviceQueues[base].length;
+              selectedBase = base;
+            }
           }
+        } else {
+          // No online devices - try localhost as last resort
+          selectedBase = this.ollamaBases.find(b => b.includes('localhost')) || this.ollamaBases[0];
+          console.warn(`[LLM] No online devices! Falling back to ${selectedBase}`);
         }
       }
-      
-      // Fallback
-      if (!selectedBase) selectedBase = this.ollamaBases[0];
 
-      const tps = this.devicePerformance[selectedBase]?.tps.toFixed(1) || '?';
-      console.log(`[LLM] Assigning request to ${selectedBase} (TPS: ${tps})`);
+      const queueSize = this.deviceQueues[selectedBase].length;
+      const capacity = this.loadBalancer.deviceCapacities[selectedBase] || 0;
+      const tps = this.devicePerformance[selectedBase]?.tps?.toFixed(1) || '0';
+      
+      console.log(
+        `[LLM] Queuing request to ${selectedBase} ` +
+        `(TPS: ${tps}, Queue: ${queueSize}/${capacity}, will wait for assignment)`
+      );
+      
       this.deviceQueues[selectedBase].push(request);
       this.processDeviceQueue(selectedBase);
     });
@@ -262,12 +368,30 @@ class LLMService {
   }
 
   async processDeviceQueue(base) {
-    if (this.deviceBusy[base] || this.deviceQueues[base].length === 0) return;
+    // Allow up to 2 concurrent requests per device for better throughput
+    const maxConcurrent = 2;
+    const currentActive = this.deviceBusy[base] || 0;
     
-    this.deviceBusy[base] = true;
-    const { question, trainingData, llmKnowledge, resolve } = this.deviceQueues[base].shift();
+    if (currentActive >= maxConcurrent || this.deviceQueues[base].length === 0) return;
     
-    console.log(`[LLM] Processing request on ${base} (queue: ${this.deviceQueues[base].length} remaining)`);
+    // Increment active request counter
+    this.deviceBusy[base] = currentActive + 1;
+    const request = this.deviceQueues[base].shift();
+    
+    // Guard against undefined request (race condition)
+    if (!request) {
+      this.deviceBusy[base] = Math.max(0, this.deviceBusy[base] - 1);
+      return;
+    }
+    
+    const { question, trainingData, llmKnowledge, resolve, reject } = request;
+    
+    console.log(`[LLM] Processing request on ${base} (active: ${this.deviceBusy[base]}, queue: ${this.deviceQueues[base].length} remaining)`);
+    
+    // Start processing next request immediately if capacity available
+    if (this.deviceQueues[base].length > 0 && this.deviceBusy[base] < maxConcurrent) {
+      setImmediate(() => this.processDeviceQueue(base));
+    }
     
     try {
       if (!this.isInitialized) await this.initialize();
@@ -277,15 +401,23 @@ class LLMService {
         : await this.generateWithTransformers(question, context);
       resolve(response);
     } catch (error) {
-      console.error('[LLM] Error generating response on', base, ':', error);
+      console.error('[LLM] Error generating response on', base, ':', error.message);
+      
+      // Mark device as offline if it fails
+      this.loadBalancer.markOffline(base);
+      this.devicePerformance[base].tps = 0;
+      this.devicePerformance[base].acceleration = 'offline';
+      
+      // Always resolve with fallback message instead of rejecting to maintain stability
       resolve("I'm still learning. Please ask me again later!");
     } finally {
-      this.deviceBusy[base] = false;
+      // Decrement active request counter
+      this.deviceBusy[base] = Math.max(0, this.deviceBusy[base] - 1);
       
-      // Continue processing this device's queue if there are more requests
+      // Continue processing queue if items remain and capacity available
       if (this.deviceQueues[base].length > 0) {
         console.log(`[LLM] ${base} processing next queued request`);
-        this.processDeviceQueue(base);
+        setImmediate(() => this.processDeviceQueue(base));
       }
     }
   }
@@ -307,7 +439,14 @@ class LLMService {
         return res;
       };
 
-      const options = { temperature: 0.7, num_predict: 50, stop: ['\n', 'Question:', '?'], num_gpu: 99 };
+      const options = { 
+        temperature: 0.7, 
+        num_predict: 50, 
+        stop: ['\n', 'Question:', '?'], 
+        num_gpu: 99,     // Offload all layers to GPU/Metal
+        f16_kv: true,    // Half-precision for faster Metal inference
+        low_vram: false  // Disable VRAM optimization (not needed on unified memory)
+      };
 
       let response = await tryRequest('/api/generate', { model: this.modelName, prompt, stream: false, options });
 
@@ -344,6 +483,12 @@ class LLMService {
       if (!response.ok) throw new Error(`Ollama request failed: ${response.status}`);
 
       const data = await response.json();
+      
+      // Update load balancer's average token count if available
+      if (data.eval_count) {
+        this.loadBalancer.updateAverageTokens(data.eval_count);
+      }
+      
       let answer = (data.response || (data.message && data.message.content) || '').trim();
       if (!answer || answer.length < 3) answer = "I don't have enough information to answer that yet.";
       console.log('[LLM] Generated response:', answer);
@@ -389,6 +534,66 @@ class LLMService {
 
   getModelName() {
     return this.modelName;
+  }
+
+  /**
+   * Get load balancer queue health metrics
+   * @returns {Object} Health status for all devices
+   */
+  getQueueHealth() {
+    return this.loadBalancer.getQueueHealth(this.deviceQueues);
+  }
+
+  /**
+   * Get load balancer metrics summary
+   * @returns {Object} Capacity and ranking info
+   */
+  getLoadBalancerMetrics() {
+    return this.loadBalancer.getMetricsSummary();
+  }
+
+  /**
+   * Check if system can handle additional students
+   * @param {number} additionalStudents - Number of students to add
+   * @returns {Object} Feasibility analysis
+   */
+  canHandleAdditionalLoad(additionalStudents) {
+    return this.loadBalancer.canHandleLoad(this.deviceQueues, additionalStudents);
+  }
+
+  /**
+   * Adjust TPS per person ratio for load balancing
+   * @param {number} newRatio - New TPS per person value
+   */
+  setTPSRatio(newRatio) {
+    this.loadBalancer.setTPSPerPerson(newRatio);
+    
+    // Recalculate capacities with new ratio
+    const deviceMetrics = this.ollamaBases.map(base => ({
+      base,
+      tps: this.devicePerformance[base].tps
+    }));
+    this.loadBalancer.updateDeviceMetrics(deviceMetrics);
+  }
+
+  /**
+   * Enable or disable greedy algorithm for load balancing
+   * @param {boolean} enabled - Enable or disable greedy mode
+   */
+  setGreedyMode(enabled) {
+    this.loadBalancer.setGreedyMode(enabled);
+  }
+
+  /**
+   * Get current load balancer configuration
+   * @returns {Object} Configuration including greedy mode status
+   */
+  getLoadBalancerConfig() {
+    return {
+      useGreedy: this.loadBalancer.useGreedy,
+      tpsPerPerson: this.loadBalancer.tpsPerPerson,
+      avgTokensPerRequest: this.loadBalancer.avgTokensPerRequest
+    };
   }
 }
 

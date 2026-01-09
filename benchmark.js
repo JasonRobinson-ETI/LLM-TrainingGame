@@ -1,11 +1,94 @@
 import WebSocket from 'ws';
 import { v4 as uuidv4 } from 'uuid';
+import { WebSocketServer } from 'ws';
+import { createServer } from 'http';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
-const NUM_STUDENTS = 50;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const NUM_STUDENTS = 100;
 const SERVER_URL = 'ws://localhost:3001';
-const QUESTIONS_PER_STUDENT = 20; // More questions for 30 min session
-const TRAINING_DURATION = 1800000; // 30 minutes
-const QUERY_DURATION = 900000; // 15 minutes
+const VISUALIZER_PORT = 3002;
+const QUESTIONS_PER_STUDENT = 20;
+const TRAINING_DURATION = 120000; // 2 minutes (shortened for benchmark)
+const QUERY_DURATION = 30000; // 30 seconds (shortened for benchmark)
+
+// HTTP server to serve visualizer
+const visualizerServer = createServer((req, res) => {
+  if (req.url === '/' || req.url === '/index.html') {
+    try {
+      const html = readFileSync(join(__dirname, 'benchmark-visualizer.html'), 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(html);
+    } catch (err) {
+      res.writeHead(404);
+      res.end('Visualizer HTML not found');
+    }
+  } else {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+});
+
+// Visualizer WebSocket server
+const visualizerWss = new WebSocketServer({ server: visualizerServer });
+const visualizerClients = new Set();
+
+visualizerWss.on('connection', (ws) => {
+  console.log('[VISUALIZER] Client connected');
+  visualizerClients.add(ws);
+  
+  // Send initial state with current stats
+  ws.send(JSON.stringify({
+    type: 'init',
+    totalStudents: NUM_STUDENTS,
+    currentStats: {
+      connectedStudents: stats.connectedStudents,
+      questionsSubmitted: stats.questionsSubmitted,
+      answersReceived: stats.answersReceived,
+      challengesReceived: stats.challengesReceived,
+      challengesCompleted: stats.challengesCompleted,
+      challengesFailed: stats.challengesFailed,
+      llmQueriesSubmitted: stats.llmQueriesSubmitted,
+      llmResponsesReceived: stats.llmResponsesReceived,
+      llmPlaceholderResponses: stats.llmPlaceholderResponses,
+      llmRealResponses: stats.llmRealResponses,
+      errors: stats.errors
+    }
+  }));
+  
+  // Send already-connected students
+  students.forEach((student, idx) => {
+    if (student.connected) {
+      ws.send(JSON.stringify({
+        type: 'student_connected',
+        id: idx + 1,
+        name: student.name
+      }));
+    }
+  });
+  
+  ws.on('close', () => {
+    visualizerClients.delete(ws);
+  });
+});
+
+visualizerServer.listen(VISUALIZER_PORT, () => {
+  console.log(`\n[VISUALIZER] Dashboard available at http://localhost:${VISUALIZER_PORT}`);
+  console.log(`Open benchmark-visualizer.html in your browser to view real-time stats\n`);
+});
+
+function broadcastToVisualizer(data) {
+  const message = JSON.stringify(data);
+  visualizerClients.forEach(client => {
+    if (client.readyState === 1) {
+      client.send(message);
+    }
+  });
+}
 
 const stats = {
   connectedStudents: 0,
@@ -13,6 +96,7 @@ const stats = {
   answersReceived: 0,
   challengesReceived: 0,
   challengesCompleted: 0,
+  challengesFailed: 0,
   llmQueriesSubmitted: 0,
   llmResponsesReceived: 0,
   llmPlaceholderResponses: 0,
@@ -62,6 +146,13 @@ class SimulatedStudent {
         console.log(`[${this.name}] Connected in ${connectTime}ms`);
         this.connected = true;
         stats.connectedStudents++;
+        
+        // Broadcast to visualizer
+        broadcastToVisualizer({ 
+          type: 'student_connected', 
+          id: parseInt(this.id.split('_')[1]),
+          name: this.name 
+        });
         
         this.ws.send(JSON.stringify({
           type: 'register',
@@ -140,10 +231,17 @@ class SimulatedStudent {
           stats.answersReceived++;
           const activity = stats.studentActivity.get(this.id);
           if (activity) activity.questionsAnswered++;
+          
+          // Broadcast to visualizer
+          broadcastToVisualizer({
+            type: 'answer_received',
+            studentId: parseInt(this.id.split('_')[1])
+          });
           break;
           
         case 'challenge_assigned':
           stats.challengesReceived++;
+          broadcastToVisualizer({ type: 'challenge' });
           this.completeChallenge(message.challenge);
           break;
           
@@ -172,6 +270,15 @@ class SimulatedStudent {
               stats.llmRealResponses++;
               console.log(`[${this.name}] ✅ LLM real response (${latency}ms): "${message.response.substring(0, 60)}..."`);
             }
+            
+            // Broadcast to visualizer
+            broadcastToVisualizer({
+              type: 'llm_response',
+              question: message.question,
+              response: message.response.substring(0, 60),
+              latency,
+              isPlaceholder
+            });
           }
           break;
       }
@@ -203,6 +310,13 @@ class SimulatedStudent {
     const activity = stats.studentActivity.get(this.id);
     if (activity) activity.questionsAsked++;
     
+    // Broadcast to visualizer
+    broadcastToVisualizer({
+      type: 'question_submitted',
+      studentId: parseInt(this.id.split('_')[1]),
+      question: String(questionText).substring(0, 50)
+    });
+    
     console.log(`[${this.name}] Submitted question ${this.questionsSubmitted}/${QUESTIONS_PER_STUDENT}: ${String(questionText).substring(0, 50)}...`);
   }
 
@@ -227,18 +341,31 @@ class SimulatedStudent {
     
     setTimeout(() => {
       const completeStart = Date.now();
+      // 70% success rate, 30% failure rate
+      const success = Math.random() > 0.3;
+      
       this.ws.send(JSON.stringify({
         type: 'challenge_completed',
         challengeId: challenge.id,
-        success: true
+        success: success
       }));
       stats.challengeCompletionTimes.push(Date.now() - completeStart);
-      stats.challengesCompleted++;
       
-      const activity = stats.studentActivity.get(this.id);
-      if (activity) activity.challengesCompleted++;
-      
-      console.log(`[${this.name}] Completed challenge: ${challenge.type}`);
+      if (success) {
+        stats.challengesCompleted++;
+        broadcastToVisualizer({ type: 'challenge_completed', success: true });
+        const activity = stats.studentActivity.get(this.id);
+        if (activity) activity.challengesCompleted++;
+        console.log(`[${this.name}] ✅ Passed challenge: ${challenge.type}`);
+      } else {
+        stats.challengesFailed++;
+        broadcastToVisualizer({ 
+          type: 'challenge_failed', 
+          studentId: parseInt(this.id.split('_')[1]),
+          challengeType: challenge.type
+        });
+        console.log(`[${this.name}] ❌ Failed challenge: ${challenge.type} - Corrupting training data!`);
+      }
     }, 200 + Math.random() * 300);
   }
 
@@ -254,6 +381,18 @@ class SimulatedStudent {
     
     this.queriesSubmitted++;
     stats.llmQueriesSubmitted++;
+    
+    // Update activity tracker
+    const activity = stats.studentActivity.get(this.id);
+    if (activity) activity.llmQueries++;
+    
+    // Broadcast to visualizer
+    broadcastToVisualizer({
+      type: 'llm_query',
+      question,
+      studentId: parseInt(this.id.split('_')[1])
+    });
+    
     console.log(`[${this.name}] Querying LLM: "${question}"`);
   }
 
@@ -361,6 +500,7 @@ async function runBenchmark() {
   
   // Phase 0: Connect teacher
   console.log('\n[PHASE 0] Connecting teacher...\n');
+  broadcastToVisualizer({ type: 'phase', phase: 0, name: 'Teacher Connect' });
   const phase0Start = Date.now();
   teacher = new SimulatedTeacher();
   await teacher.connect();
@@ -370,11 +510,13 @@ async function runBenchmark() {
   
   // Phase 1: Connect students
   console.log('\n[PHASE 1] Connecting students...\n');
+  broadcastToVisualizer({ type: 'phase', phase: 1, name: 'Student Connect' });
   const phase1Start = Date.now();
   const connectPromises = students.map(student => 
     student.connect().catch(err => {
       console.error(`Failed to connect ${student.name}:`, err.message);
       stats.errors++;
+      broadcastToVisualizer({ type: 'error', message: `Failed to connect ${student.name}` });
     })
   );
   
@@ -385,6 +527,7 @@ async function runBenchmark() {
   
   // Phase 2: Start game
   console.log('\n[PHASE 2] Starting game...\n');
+  broadcastToVisualizer({ type: 'phase', phase: 2, name: 'Game Start' });
   const phase2Start = Date.now();
   teacher.startGame();
   
@@ -393,26 +536,68 @@ async function runBenchmark() {
   console.log(`\n[PHASE 2 COMPLETE] Game started in ${stats.phaseTimings.gameStart}ms\n`);
   captureMemorySnapshot('Game Started');
   
+  // Fetch initial device info
+  try {
+    const deviceInfo = await fetch('http://localhost:3001/api/devices').then(res => res.json());
+    broadcastToVisualizer({ type: 'devices', ...deviceInfo });
+  } catch (err) {
+    console.error('[VISUALIZER] Failed to fetch initial device info:', err.message);
+  }
+  
   // Phase 3: Training phase
   console.log('\n[PHASE 3] Students actively asking and answering (training phase)...\n');
+  broadcastToVisualizer({ type: 'phase', phase: 3, name: 'Training Phase' });
   console.log(`\n[RUNNING] Training phase will run for ${TRAINING_DURATION/1000} seconds...\n`);
+  console.log('[TRAINING] Students waiting for server to assign roles and send prompts...\n');
   const phase3Start = Date.now();
   
-  // Take memory snapshots during training
+  // Log training progress every 10 seconds
+  const trainingLogInterval = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - phase3Start) / 1000);
+    console.log(`[TRAINING] ${elapsed}s elapsed - Questions: ${stats.questionsSubmitted}, Answers: ${stats.answersReceived}, Challenges: ${stats.challengesCompleted}/${stats.challengesReceived}`);
+  }, 10000);
+  
+  // Take memory snapshots during training and broadcast progress
   const memoryInterval = setInterval(() => {
     captureMemorySnapshot('Training Phase');
-  }, 60000); // Every minute
+    const latest = stats.memorySnapshots[stats.memorySnapshots.length - 1];
+    broadcastToVisualizer({ type: 'memory', memory: latest });
+    
+    // Broadcast training progress
+    const elapsed = Date.now() - phase3Start;
+    const percent = Math.min(100, Math.round((elapsed / TRAINING_DURATION) * 100));
+    broadcastToVisualizer({ type: 'progress', percent });
+    
+    // Fetch and broadcast device info
+    fetch('http://localhost:3001/api/devices')
+      .then(res => res.json())
+      .then(data => {
+        broadcastToVisualizer({ type: 'devices', ...data });
+      })
+      .catch(err => console.error('[VISUALIZER] Failed to fetch device info:', err.message));
+  }, 5000); // Every 5 seconds
   
   await new Promise(resolve => setTimeout(resolve, TRAINING_DURATION));
   clearInterval(memoryInterval);
+  clearInterval(trainingLogInterval);
   stats.phaseTimings.training = Date.now() - phase3Start;
   console.log(`\n[PHASE 3 COMPLETE] Training phase completed in ${(stats.phaseTimings.training / 1000).toFixed(2)}s\n`);
+  console.log(`[TRAINING] Final counts - Questions: ${stats.questionsSubmitted}, Answers: ${stats.answersReceived}, Challenges: ${stats.challengesCompleted}/${stats.challengesReceived}\n`);
   captureMemorySnapshot('Training Complete');
   
   // Phase 4: Query the trained LLM
   console.log('\n[PHASE 4] Querying the trained LLM...\n');
-  const phase4Start = Date.now();
+  broadcastToVisualizer({ type: 'phase', phase: 4, name: 'Query LLM' });
+  const phase4Start = Date.now();  
+  // Check how much training data was collected
+  console.log(`\n[DIAGNOSTICS] Checking training data...`);
+  console.log(`  Questions Submitted: ${stats.questionsSubmitted}`);
+  console.log(`  Answers Received: ${stats.answersReceived}`);
+  console.log(`  Expected ${NUM_STUDENTS * QUESTIONS_PER_STUDENT} questions total\n`);
   
+  if (stats.answersReceived < 10) {
+    console.warn(`  ⚠️  WARNING: Very few answers collected (${stats.answersReceived}). LLM may not have enough training data!\n`);
+  }  
   const llmQueries = [
     "Who is the most helpful student?",
     "Who makes everyone laugh?",
@@ -424,16 +609,41 @@ async function runBenchmark() {
     "Who is really smart?"
   ];
   
+  const llmQueriesSubmitted = new Set();
+  
   for (const student of students) {
     if (student.connected) {
       const query = llmQueries[Math.floor(Math.random() * llmQueries.length)];
       student.queryLLM(query);
+      llmQueriesSubmitted.add(student.id);
       await new Promise(resolve => setTimeout(resolve, 200));
     }
   }
   
-  console.log(`\n[WAITING] Waiting ${QUERY_DURATION/1000} seconds for LLM responses...\n`);
-  await new Promise(resolve => setTimeout(resolve, QUERY_DURATION));
+  console.log(`\n[WAITING] Submitted ${llmQueriesSubmitted.size} queries. Waiting for all responses...\n`);
+  
+  // Wait indefinitely until all responses are received
+  const checkInterval = 5000; // Check every 5 seconds
+  let elapsed = 0;
+  
+  while (stats.llmResponsesReceived < llmQueriesSubmitted.size) {
+    await new Promise(resolve => setTimeout(resolve, checkInterval));
+    elapsed += checkInterval;
+    
+    const responseCount = stats.llmResponsesReceived;
+    const stillWaiting = llmQueriesSubmitted.size - responseCount;
+    console.log(`[WAITING] ${elapsed/1000}s - Received ${responseCount}/${llmQueriesSubmitted.size} responses (${stillWaiting} pending)`);
+    
+    // Fetch and broadcast device info to show queue status
+    try {
+      const deviceInfo = await fetch('http://localhost:3001/api/devices').then(res => res.json());
+      broadcastToVisualizer({ type: 'devices', ...deviceInfo });
+    } catch (err) {
+      console.error('[VISUALIZER] Failed to fetch device info:', err.message);
+    }
+  }
+  
+  console.log(`[WAITING] ✓ All ${stats.llmResponsesReceived} responses received!`);
   
   stats.phaseTimings.query = Date.now() - phase4Start;
   console.log(`\n[PHASE 4 COMPLETE] Query phase completed in ${(stats.phaseTimings.query / 1000).toFixed(2)}s\n`);
@@ -546,7 +756,12 @@ async function runBenchmark() {
   console.log(`  Questions Submitted: ${stats.questionsSubmitted}`);
   console.log(`  Answers Received: ${stats.answersReceived}`);
   console.log(`  Challenges Received: ${stats.challengesReceived}`);
-  console.log(`  Challenges Completed: ${stats.challengesCompleted}`);
+  console.log(`  Challenges Completed (✅): ${stats.challengesCompleted}`);
+  console.log(`  Challenges Failed (❌): ${stats.challengesFailed}`);
+  if (stats.challengesReceived > 0) {
+    const successRate = ((stats.challengesCompleted / stats.challengesReceived) * 100).toFixed(1);
+    console.log(`  Challenge Success Rate: ${successRate}%`);
+  }
   
   console.log(`\nQuery Phase (Testing Trained LLM):`);
   console.log(`  LLM Queries Submitted: ${stats.llmQueriesSubmitted}`);

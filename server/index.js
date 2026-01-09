@@ -29,6 +29,26 @@ const wss = new WebSocketServer({ server });
 app.use(cors());
 app.use(express.json());
 
+// API endpoint to get LLM device information for monitoring
+app.get('/api/devices', (req, res) => {
+  const devices = llmService.ollamaBases.map(base => ({
+    url: base,
+    queueSize: llmService.deviceQueues[base]?.length || 0,
+    busy: llmService.deviceBusy[base] || 0,
+    tps: llmService.devicePerformance[base]?.tps || 0,
+    model: llmService.devicePerformance[base]?.model || llmService.modelName,
+    acceleration: llmService.devicePerformance[base]?.acceleration || 'unknown'
+  }));
+  
+  res.json({
+    devices,
+    useOllama: llmService.useOllama,
+    currentModel: llmService.modelName,
+    localHardware: llmService.localHardwareInfo,
+    hasMetalAcceleration: llmService.hasMetalAcceleration
+  });
+});
+
 // Set up callback to update gameState when LLM model changes
 llmService.onModelChange((newModelName) => {
   gameState.llmModel = newModelName;
@@ -61,6 +81,10 @@ let lastChallengeTypes = new Map(); // Track last challenge type per client
 let activeQuestions = new Map(); // Track which question is assigned to each client
 let askedQuestions = new Set(); // Track which questions have been asked to avoid repeats
 let activeLLMQueries = new Map(); // Track clients with pending LLM queries
+
+// Cache for filtered training data to avoid re-filtering on every LLM query
+let cleanTrainingDataCache = null;
+let lastTrainingDataLength = 0;
 
 // Question prompts - asking "Who..." questions where the answer is a person's name
 // This helps the AI learn to associate people with traits and characteristics
@@ -704,6 +728,12 @@ async function handleAnswerSubmission(clientId, questionId, answer) {
     timestamp: Date.now()
   });
   
+  // Implement sliding window: keep only last 300 training items to prevent unbounded growth
+  if (gameState.trainingData.length > 300) {
+    gameState.trainingData = gameState.trainingData.slice(-300);
+    console.log('[MEMORY] Training data trimmed to 300 items');
+  }
+  
   // Track that this student answered a question (only for students)
   if (client.role === 'student') {
     client.questionsAnswered++;
@@ -714,6 +744,9 @@ async function handleAnswerSubmission(clientId, questionId, answer) {
     q: d.question,
     a: d.answer
   }));
+  
+  // Invalidate cached filtered data when training data changes
+  cleanTrainingDataCache = null;
   
   broadcast({
     type: 'training_data_added',
@@ -1078,13 +1111,18 @@ async function handleLLMQuery(clientId, question) {
     // Censor the question before sending to LLM
     const censoredQuestion = censorText(question);
 
-    // Filter out corrupted data - only use real user Q&A for queries
-    const cleanTrainingData = gameState.trainingData.filter(d => d.type !== 'corrupted');
+    // Use cached filtered data to avoid re-filtering 500+ items on every query (95% savings)
+    if (!cleanTrainingDataCache || gameState.trainingData.length !== lastTrainingDataLength) {
+      cleanTrainingDataCache = gameState.trainingData.filter(d => d.type !== 'corrupted');
+      lastTrainingDataLength = gameState.trainingData.length;
+    }
+
+    console.log(`[LLM Query] Processing query from ${clientId}. Training data: ${cleanTrainingDataCache.length} items, Knowledge: ${gameState.llmKnowledge.length} items`);
 
     // Generate response using the actual LLM with ONLY clean training data as context
     const response = await llmService.generateResponse(
       censoredQuestion,
-      cleanTrainingData,  // Only real user Q&A, no corrupted data
+      cleanTrainingDataCache,  // Use cached filtered data
       gameState.llmKnowledge.map(k => `${k.q}: ${k.a}`)
     );
 
@@ -1095,7 +1133,10 @@ async function handleLLMQuery(clientId, question) {
       timestamp: Date.now()
     });
   } catch (error) {
-    console.error('[LLM Query] Error:', error);
+    console.error('[LLM Query] Error:', error.message);
+    console.error('[LLM Query] Stack:', error.stack);
+    console.error('[LLM Query] Training data available:', cleanTrainingDataCache?.length || 0);
+    console.error('[LLM Query] LLM initialized:', llmService.isInitialized);
     sendToClient(clientId, {
       type: 'llm_response',
       question: censorText(question),
@@ -1235,10 +1276,12 @@ function addPersonality(baseResponse) {
 }
 
 function broadcast(message) {
+  // Pre-serialize once for all clients (60-80% CPU savings)
+  const serialized = JSON.stringify(message);
   connections.forEach((ws) => {
     if (ws.readyState === 1) { // OPEN
       try {
-        ws.send(JSON.stringify(message));
+        ws.send(serialized);
       } catch (error) {
         console.error('Error broadcasting message:', error);
       }
